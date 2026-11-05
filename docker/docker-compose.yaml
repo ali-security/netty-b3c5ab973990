@@ -29,7 +29,7 @@ services:
 
   build:
     <<: *common
-    command: /bin/bash -cl "./mvnw clean install -Dio.netty.testsuite.badHost=netty.io -Dtcnative.classifier=linux-x86_64-fedora"
+    command: /bin/bash -cl "./mvnw clean install -pl codec-http2 -am -Dio.netty.testsuite.badHost=netty.io -Dtcnative.classifier=linux-x86_64-fedora $${TEST_FILTER:+-Dtest=$$TEST_FILTER -DfailIfNoTests=false}"
 
   deploy:
     <<: *common
@@ -43,7 +43,7 @@ services:
       - ~/.m2:/root/.m2
       - ~/local-staging:/root/local-staging
       - ..:/code
-    command: /bin/bash -cl "./mvnw clean package org.sonatype.plugins:nexus-staging-maven-plugin:deploy -DaltStagingDirectory=/root/local-staging -DskipRemoteStaging=true -DskipTests=true"
+    command: /bin/bash -cl "./mvnw clean package -DskipTests=true"
 
   stage-release:
     <<: *common

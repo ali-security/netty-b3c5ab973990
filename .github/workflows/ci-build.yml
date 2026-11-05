@@ -16,14 +16,13 @@
 name: Build project
 
 on:
-  push:
-    branches: [ "4.1"]
-
-  schedule:
-    - cron: '30 1 * * 1'  # At 01:30 on Monday, every Monday.
-
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
 
 env:
   MAVEN_OPTS: -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.http.retryhandler.count=5 -Dmaven.wagon.httpconnectionManager.ttlSeconds=240
@@ -31,20 +30,21 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       matrix:
         include:
           - setup: linux-x86_64-java11
             docker-compose-build: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-6.111.yaml build"
-            docker-compose-run: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-6.111.yaml run build"
+            docker-compose-run: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-6.111.yaml run -e TEST_FILTER build"
 
     name: ${{ matrix.setup }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       # Cache .m2/repository
       - name: Cache local Maven repository
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-${{ matrix.setup }}-${{ hashFiles('**/pom.xml') }}
@@ -52,26 +52,141 @@ jobs:
             ${{ runner.os }}-maven-${{ matrix.setup }}-
             ${{ runner.os }}-maven-
 
-      # Enable caching of Docker layers
-      - uses: satackey/action-docker-layer-caching@v0.0.11
-        continue-on-error: true
-        with:
-          key: build-docker-cache-${{ matrix.setup }}-{hash}
-          restore-keys: |
-            build-docker-cache-${{ matrix.setup }}-
-            build-docker-cache-
-
       - name: Build docker image
-        run: docker-compose ${{ matrix.docker-compose-build }}
+        run: docker compose ${{ matrix.docker-compose-build }}
 
       - name: Build project without leak detection
-        run: docker-compose ${{ matrix.docker-compose-run }} | tee build.output
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        shell: bash
+        run: docker compose ${{ matrix.docker-compose-run }} | tee build.output
 
       - name: Checking for test failures
         run: ./.github/scripts/check_build_result.sh build.output
 
-      - uses: actions/upload-artifact@v2
-        if: ${{ failure() }}
-        with:
-          name: target
-          path: "**/target/"
+      - name: Print per-test surefire results
+        if: ${{ always() }}
+        shell: python3 {0}
+        run: |
+          """Print per-class surefire results, every skipped test with its reason, and totals (last)."""
+          REASONS = {
+              "testCapacityDecrease": "assumeTrue(maxCapacity == Integer.MAX_VALUE) in newBuffer() (AbstractCompositeByteBufTest:66, SlicedByteBufTest:37): composite/sliced bufs cannot have bounded maxCapacity; by design",
+              "testCapacityEnforceMaxCapacity": "assumeTrue(maxCapacity == Integer.MAX_VALUE) in newBuffer() (AbstractCompositeByteBufTest:66, SlicedByteBufTest:37): composite/sliced bufs cannot have bounded maxCapacity; by design",
+              "testCapacityIncrease": "assumeTrue(maxCapacity == Integer.MAX_VALUE) in newBuffer() (AbstractCompositeByteBufTest:66, SlicedByteBufTest:37): composite/sliced bufs cannot have bounded maxCapacity; by design",
+              "testCapacityNegative": "assumeTrue(maxCapacity == Integer.MAX_VALUE) in newBuffer() (AbstractCompositeByteBufTest:66, SlicedByteBufTest:37): composite/sliced bufs cannot have bounded maxCapacity; by design",
+              "testMaxFastWritableBytes": "assumeTrue(maxCapacity == Integer.MAX_VALUE) in newBuffer() (AbstractCompositeByteBufTest:66, SlicedByteBufTest:37): test asks newBuffer(150,500), unsupported for composite/sliced; by design",
+              "testNioBuffer1": "assumeTrue(buffer.nioBufferCount() == 1) (AbstractByteBufTest:2207): composite buffers span several components; by design, not environment",
+              "testToByteBuffer2": "assumeTrue(buffer.nioBufferCount() == 1) (AbstractByteBufTest:2219): composite buffers span several components; by design, not environment",
+              "testToByteBuffer3": "assumeTrue(buffer.nioBufferCount() == 1) (AbstractByteBufTest:2245): composite buffers span several components; by design, not environment",
+              "testGetBytesHeapWithArrayLengthGreaterThanCapacity": "assumeThat(bufferType, is(HEAP_UNPOOLED)) (ByteBufUtilTest:894): heap-array test runs only for the HEAP_UNPOOLED parameter; other params skip by design",
+              "testGetBytesHeapWithNonZeroArrayOffset": "assumeThat(bufferType, is(HEAP_UNPOOLED)) (ByteBufUtilTest:874): heap-array test runs only for the HEAP_UNPOOLED parameter; other params skip by design",
+              "testIsTextMultiThreaded": "assumeThat(bufferType, is(HEAP_UNPOOLED)) (ByteBufUtilTest:823): runs only for the HEAP_UNPOOLED parameter; other params skip by design",
+              "PlatformDependent0Test": "@BeforeClass assumeTrue(hasDirectBufferNoCleanerConstructor()) (PlatformDependent0Test:32): JDK 11 without -Dio.netty.tryReflectionSetAccessible=true cannot open DirectByteBuffer(long,int)",
+              "testAllocateWithCapacity0": "assumeTrue(hasDirectBufferNoCleanerConstructor()) (PlatformDependentTest:151): JDK 11 without -Dio.netty.tryReflectionSetAccessible=true cannot open DirectByteBuffer(long,int)",
+              "testConcurrentMessageBufferAccess": "upstream bare @Ignore on the method (LocalTransportThreadModelTest:229); never runs in any environment",
+              "HashCollisionTest": "upstream class-level @Ignore (HashCollisionTest:40); the class has no @Test methods, only a main() analysis tool",
+              "testFireChannelReadAfterHandshakeSuccess_OPENSSL": "assumeTrue(SslProvider.isAlpnSupported(OPENSSL)) (Http2MultiplexTransportTest:458): ALPN needs OpenSSL >= 1.0.2; tcnative fedora classifier links CentOS 6 system OpenSSL 1.0.1e",
+              "testSSLExceptionOpenSslTLSv12": "assumeTrue(SslProvider.isAlpnSupported(OPENSSL)) (Http2MultiplexTransportTest:302): ALPN needs OpenSSL >= 1.0.2; tcnative links CentOS 6 system OpenSSL 1.0.1e",
+              "testSSLExceptionOpenSslTLSv13": "assumeTrue(SslProvider.isAlpnSupported(OPENSSL)) (Http2MultiplexTransportTest:302), then TLSv1.3 guard (:304): needs OpenSSL >= 1.0.2 / 1.1.1; image has 1.0.1e",
+              "upgradeEventNoRefCntError": "assumeTrue(ReflectionUtil.trySetAccessible(ctor, true) == null) (Http2FrameCodecTest:850): Java 9+ refuses unless -Dio.netty.tryReflectionSetAccessible=true",
+              "upgradeWithoutFlowControlling": "assumeTrue(ReflectionUtil.trySetAccessible(ctor, true) == null) (Http2FrameCodecTest:888): Java 9+ refuses unless -Dio.netty.tryReflectionSetAccessible=true",
+              "ConscryptJdkSslEngineInteropTest": "@BeforeClass assumeTrue(Conscrypt.isAvailable()): conscrypt-openjdk-uber 2.5.2 JNI needs GLIBC_2.14/2.16; CentOS 6 image has glibc 2.12",
+              "ConscryptOpenSslEngineInteropTest": "inherited @BeforeClass assumeTrue(Conscrypt.isAvailable()) (ConscryptSslEngineTest:50): conscrypt 2.5.2 JNI needs GLIBC_2.14/2.16; CentOS 6 has glibc 2.12",
+              "ConscryptSslEngineTest": "@BeforeClass assumeTrue(Conscrypt.isAvailable()) (ConscryptSslEngineTest:50): conscrypt 2.5.2 JNI needs GLIBC_2.14/2.16; CentOS 6 has glibc 2.12",
+              "JdkConscryptSslEngineInteropTest": "@BeforeClass assumeTrue(Conscrypt.isAvailable()) (JdkConscryptSslEngineInteropTest:52): conscrypt 2.5.2 JNI needs GLIBC_2.14/2.16; CentOS 6 has glibc 2.12",
+              "OpenSslConscryptSslEngineInteropTest": "inherited @BeforeClass assumeTrue(Conscrypt.isAvailable()) (ConscryptSslEngineTest:50): conscrypt 2.5.2 JNI needs GLIBC_2.14/2.16; CentOS 6 has glibc 2.12",
+              "OpenSslPrivateKeyMethodTest": "@BeforeClass checkShouldUseKeyManagerFactory() + assumeTrue(OpenSsl.isBoringSSL()) (OpenSslPrivateKeyMethodTest:92,94): system OpenSSL 1.0.1e, not BoringSSL",
+              "OcspTest": "@BeforeClass assumeTrue(OpenSsl.isOcspSupported()) (OcspTest:68): OCSP stapling needs OpenSSL >= 1.0.2; tcnative links system OpenSSL 1.0.1e",
+              "eventsOrder": "assumeTrue(SslProvider.isTlsv13Supported(OPENSSL)) for the {OPENSSL, TLSv1.3} param (CloseNotifyTest:87): TLSv1.3 needs OpenSSL 1.1.1+, image has 1.0.1e",
+              "testAlpn": "assumeTrue(OpenSsl.isAlpnSupported()) (OpenSslEngineTest:223): ALPN needs OpenSSL >= 1.0.2; tcnative links system OpenSSL 1.0.1e",
+              "testAlpnCompatibleProtocolsDifferentClientOrder": "assumeTrue(OpenSsl.isAlpnSupported()) (OpenSslEngineTest:232): ALPN needs OpenSSL >= 1.0.2; tcnative links system OpenSSL 1.0.1e",
+              "testContextFromManagersOpenssl": "assumeTrue(OpenSsl.useKeyManagerFactory()) (SslContextBuilderTest:106): false because setCertificateCallback requires OpenSSL 1.0.2+, image has 1.0.1e",
+              "testHandshakeEventsTls13Openssl": "assumeTrue(SslProvider.isTlsv13Supported(OPENSSL)) (SslHandlerTest:1553): TLSv1.3 needs OpenSSL 1.1.1+, image has system OpenSSL 1.0.1e",
+              "testHandshakeFailureCipherMissmatchTLSv13OpenSsl": "assumeTrue(SslProvider.isTlsv13Supported(OPENSSL)) (SslHandlerTest:1428): TLSv1.3 needs OpenSSL 1.1.1+, image has system OpenSSL 1.0.1e",
+              "testSessionTicketsWithTLSv13": "assumeTrue(SslProvider.isTlsv13Supported(OPENSSL)) (SslHandlerTest:1123): TLSv1.3 needs OpenSSL 1.1.1+, image has system OpenSSL 1.0.1e",
+              "testSessionTicketsWithTLSv13AndNoKey": "assumeTrue(OpenSsl.isTlsv13Supported()) (SslHandlerTest:1134): TLSv1.3 needs OpenSSL 1.1.1+, image has system OpenSSL 1.0.1e",
+              "testIncompatibleCiphers": "assumeTrue(isTlsv13Supported(client/server provider)) (SSLEngineTest:528): the OpenSSL side lacks TLSv1.3 (system OpenSSL 1.0.1e)",
+              "testMasterKeyLogging": "assumeFalse(sslServerProvider()==JDK && javaVersion()>8) (SSLEngineTest:3836): JDK master-key reflection is blocked on JDK 9+; leg runs JDK 11",
+              "testHandshakeSession": "checkShouldUseKeyManagerFactory() (OpenSslTestUtils:25): OpenSsl.supportsKeyManagerFactory() false, setCertificateCallback needs OpenSSL 1.0.2+, image has 1.0.1e",
+              "testMutualAuthInvalidIntermediateCAFailWithOptionalClientAuth": "checkShouldUseKeyManagerFactory() (OpenSslTestUtils:25): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testMutualAuthInvalidIntermediateCAFailWithRequiredClientAuth": "checkShouldUseKeyManagerFactory() (OpenSslTestUtils:25): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testMutualAuthInvalidIntermediateCASucceedWithOptionalClientAuth": "checkShouldUseKeyManagerFactory() (OpenSslTestUtils:25): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testMutualAuthValidClientCertChainTooLongFailOptionalClientAuth": "checkShouldUseKeyManagerFactory() (OpenSslTestUtils:25): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testMutualAuthValidClientCertChainTooLongFailRequireClientAuth": "checkShouldUseKeyManagerFactory() (OpenSslTestUtils:25): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testNoKeyFound": "checkShouldUseKeyManagerFactory() (OpenSslEngineTest:1324): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testSessionAfterHandshakeKeyManagerFactory": "checkShouldUseKeyManagerFactory() (OpenSslTestUtils:25): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testSessionAfterHandshakeKeyManagerFactoryMutualAuth": "checkShouldUseKeyManagerFactory() (OpenSslTestUtils:25): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testSupportedSignatureAlgorithms": "checkShouldUseKeyManagerFactory() (OpenSslTestUtils:25): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testSessionLocalWhenNonMutualWithKeyManager": "checkShouldUseKeyManagerFactory() (OpenSslEngineTest:1383): OpenSsl.supportsKeyManagerFactory() false on OpenSSL 1.0.1e (needs 1.0.2+)",
+              "testSessionLocalWhenNonMutualWithoutKeyManager": "assumeTrue(OpenSsl.supportsKeyManagerFactory()) (OpenSslEngineTest:1391): false because setCertificateCallback needs OpenSSL 1.0.2+, image has 1.0.1e",
+              "testSessionCache": "assumeTrue(OpenSsl.isSessionCacheSupported()) (OpenSslEngineTest:1495): requires OpenSSL >= 1.1.0; image has system OpenSSL 1.0.1e",
+              "testSessionCacheSize": "assumeTrue(OpenSsl.isSessionCacheSupported()) (OpenSslEngineTest:1511): requires OpenSSL >= 1.1.0; image has system OpenSSL 1.0.1e",
+              "testSessionCacheTimeout": "assumeTrue(OpenSsl.isSessionCacheSupported()) (OpenSslEngineTest:1504): requires OpenSSL >= 1.1.0; image has system OpenSSL 1.0.1e",
+              "testSniWithApnHandler": "assumeTrue(OpenSsl.isAlpnSupported()) for OPENSSL params (SniHandlerTest:98): ALPN needs OpenSSL >= 1.0.2, image has 1.0.1e; JDK param needs JettyAlpn (Java <= 8 only)",
+              "testSupportedCiphers": "assumeNotNull(exception) (SslContextTest:111): JDK 11 SSLEngine accepts the disabled TLS_DH_anon_WITH_DES_CBC_SHA suite without IllegalArgumentException",
+              "testUnsupportedPrivateKeyFailsFastForClient": "assumeTrue(OpenSsl.isBoringSSL()) (SslContextBuilderTest:118): tcnative fedora classifier links system OpenSSL 1.0.1e, not BoringSSL",
+              "testUnsupportedPrivateKeyFailsFastForServer": "assumeTrue(OpenSsl.isBoringSSL()) (SslContextBuilderTest:112): tcnative fedora classifier links system OpenSSL 1.0.1e, not BoringSSL",
+          }
+          MSG_REASONS = {
+              "ALPN not on classpath": "JdkSslEngineTest ALPN_JETTY (jetty alpn-boot exists only for Java <= 8u242; root pom java11 profile drops the agent) and ALPN_CONSCRYPT (Conscrypt JNI needs glibc 2.14+) params; ALPN_JAVA params run",
+              "NPN not on classpath": "JdkSslEngineTest NPN_JETTY param: npn-boot (sun.security.ssl.NextProtoNegoExtension) exists only for JDK 7; JDK 11 leg, ALPN_JAVA params run",
+              "DirectByteBuffer.<init>(long, int) not found": "*UnsafeNoCleanerDirectByteBufTest @Before: JDK 9+ default io.netty.tryReflectionSetAccessible=false blocks the DirectByteBuffer(long,int) ctor",
+              "useDirectBufferNoCleaner() returned false": "WrappedUnpooledUnsafeByteBufTest @Before: JDK 9+ default io.netty.tryReflectionSetAccessible=false blocks the no-cleaner DirectByteBuffer ctor",
+          }
+
+          import glob
+          import re
+          import xml.etree.ElementTree as ET
+          from collections import OrderedDict
+
+
+          def reason_for(cls, name, msg):
+              base = re.sub(r"[\[(].*$", "", name or "")
+              simple = (cls or "").rsplit(".", 1)[-1]
+              if base in REASONS:
+                  return REASONS[base]
+              if simple in REASONS:
+                  return REASONS[simple]
+              for key, val in MSG_REASONS.items():
+                  if key in msg:
+                      return val
+              return None
+
+
+          classes = OrderedDict()
+          skipped = []
+          total = OrderedDict(tests=0, failures=0, errors=0, skipped=0)
+          for path in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              module = path.split("/target/")[0]
+              root = ET.parse(path).getroot()
+              for tc in root.iter("testcase"):
+                  cls = tc.get("classname") or root.get("name")
+                  c = classes.setdefault((module, cls), dict(tests=0, failures=0, errors=0, skipped=0))
+                  c["tests"] += 1
+                  total["tests"] += 1
+                  for kind, field in (("failure", "failures"), ("error", "errors"), ("skipped", "skipped")):
+                      el = tc.find(kind)
+                      if el is not None:
+                          c[field] += 1
+                          total[field] += 1
+                          if kind == "skipped":
+                              msg = (el.get("message") or (el.text or "")).strip().replace("\n", " ")
+                              line = "%s %s#%s : %s" % (module, cls, tc.get("name"), msg or "<no message>")
+                              why = reason_for(cls, tc.get("name"), msg)
+                              if why:
+                                  line += " | REASON: " + why
+                              skipped.append(line)
+
+          print("==== PER-CLASS SUREFIRE RESULTS ====")
+          for (module, cls), c in classes.items():
+              print("TESTCLASS %s %s tests=%d failures=%d errors=%d skipped=%d"
+                    % (module, cls, c["tests"], c["failures"], c["errors"], c["skipped"]))
+          print("==== SKIPPED TESTS (%d) ====" % len(skipped))
+          print("Environment: CentOS 6.10 image (upstream docker/Dockerfile.centos6), AdoptOpenJDK 11.0.11, "
+                "netty-tcnative linux-x86_64-fedora linked to system OpenSSL 1.0.1e (no TLSv1.3/ALPN/OCSP/KeyManagerFactory), glibc 2.12")
+          for line in skipped:
+              print("SKIPPED " + line)
+          passed = total["tests"] - total["failures"] - total["errors"] - total["skipped"]
+          print("==== TEST SUMMARY ====")
+          print("Tests run: %d, Failures: %d, Errors: %d, Skipped: %d, Passed: %d"
+                % (total["tests"], total["failures"], total["errors"], total["skipped"], passed))
